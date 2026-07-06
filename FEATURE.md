@@ -10,3 +10,9 @@ https://docs.langchain.com/langsmith/agent-server
 ## These are the resources that will be required:
 https://docs.langchain.com/langsmith/control-plane
 
+## Azure Resources:
+  - Kubernetes: https://azure.microsoft.com/en-us/pricing/details/kubernetes-service/
+  - PostgresDB: https://azure.microsoft.com/en-us/pricing/details/cache/
+  - Redis: https://azure.microsoft.com/en-us/pricing/details/managed-redis/
+
+Please perform research to define the cost and code required to create this architecture and detail in a report.
