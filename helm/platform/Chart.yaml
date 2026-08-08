@@ -1,0 +1,10 @@
+apiVersion: v2
+name: anubis-platform
+description: >-
+  Cluster-level plumbing shared by every Anubis workload: the External Secrets Operator
+  wiring that projects Secrets Manager into Kubernetes Secrets, the single ALB shared by
+  all three Ingresses, the EFS PersistentVolume holding the Hugging Face weight cache,
+  and the image pre-pull DaemonSet that keeps a 12.8 GB pull off the critical path.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,58 @@
+# Production values for the customer portal backend-for-frontend.
+#
+#   helm upgrade --install portal-server ./helm/portal-server \
+#     -f helm/portal-server/values-prod.yaml \
+#     --set image.tag=<git-sha> -n anubis --wait --timeout 10m
+#
+# Reached at checkout-api.neuralnexus.site through the shared ALB (helm/platform).
+# The Vercel client's VITE_API_BASE_URL already names that hostname, so nothing on the
+# client side changes when this replaces the Compose stack on host :8200.
+
+image:
+  repository: "" # <account>.dkr.ecr.us-east-2.amazonaws.com/portal-server
+  tag: "" # git SHA, set by --set at deploy time
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  port: 8080
+
+# MEDIUM scale: requests 500m / 1Gi, limits 1 CPU / 2Gi.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+envFromSecret: portal-env
+
+extraEnv:
+  # PORTAL_ENV, CLIENT_ORIGIN, NN_API_BASE_URL, the Stripe keys, and
+  # SESSION_SIGNING_SECRET all come from portal-env. Only reminders live here.
+  #
+  # USAGE_PERIOD_DAYS must match the Anubis API's own setting, or the portal's usage
+  # bars disagree with the 402s users hit in the chat app. Set in BOTH secrets.
+  []
+
+autoscaling:
+  enabled: true
+  minReplicas: 2 # MEDIUM: 3
+  maxReplicas: 4 # MEDIUM: 6
+  targetCPUUtilizationPercentage: 70
+
+nodeSelector:
+  workload: general
+
+terminationGracePeriodSeconds: 60
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: portal-server
+  annotations: {}

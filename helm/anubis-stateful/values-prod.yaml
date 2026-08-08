@@ -1,0 +1,62 @@
+# Production values for the single-replica media + MCP tier.
+#
+#   helm upgrade --install anubis-stateful ./helm/anubis-stateful \
+#     -f helm/anubis-stateful/values-prod.yaml \
+#     --set image.tag=<git-sha> -n anubis --wait --timeout 20m
+#
+# Installed AFTER anubis-api, which owns the Agent Server schema migrations.
+
+image:
+  repository: "" # <account>.dkr.ecr.us-east-2.amazonaws.com/anubis-langgraph-api
+  tag: "" # git SHA, set by --set at deploy time
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# MEDIUM scale: requests 4 CPU / 16Gi, limits 6 CPU / 24Gi.
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    cpu: "4"
+    memory: 16Gi
+
+envFromSecret: anubis-env
+
+extraEnv:
+  - name: PORT
+    value: "8000"
+  - name: HF_HOME
+    value: /root/.cache/huggingface
+  - name: DATA_ANALYSIS_ENABLED
+    value: "true"
+  - name: STRIPE_BILLING_CONFIG_FILE
+    value: ""
+  # Concurrency inside a single media batch. Keep this at or below the CPU limit: the
+  # preprocessing stages are CPU-bound, so oversubscribing turns one slow batch into
+  # several slow batches.
+  - name: MEDIA_PROCESSING_CONCURRENCY
+    value: "4"
+
+nodeSelector:
+  workload: media
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: media
+    effect: NoSchedule
+
+terminationGracePeriodSeconds: 1800
+
+modelCache:
+  enabled: true
+  claimName: anubis-model-cache
+
+analysisWorkspaceSizeGi: 50
+
+serviceAccount:
+  create: true
+  name: anubis-stateful
+  annotations: {}

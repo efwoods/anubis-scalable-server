@@ -1,0 +1,146 @@
+# Terraform plan on pull requests, apply on merge to main.
+#
+# Authentication is GitHub OIDC -- no long-lived AWS keys. The role is created by
+# terraform/modules/registry (see docs/image-pipeline.md §3); grant it the additional
+# infrastructure permissions manually, or use a separate role, before enabling apply.
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply the plan rather than only showing it"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+  pull-requests: write # to comment the plan
+
+env:
+  AWS_REGION: us-east-2
+  TF_WORKING_DIR: terraform/envs/prod
+  # Terraform's own colour codes make the PR comment unreadable.
+  TF_IN_AUTOMATION: "true"
+
+concurrency:
+  # State is a shared mutable resource; never let two runs touch it at once.
+  group: terraform-prod
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.1
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff terraform/
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+          # Truncate: a PR comment caps at 65,536 characters and a first-run plan is
+          # ~120 resources.
+          {
+            echo 'summary<<PLAN_EOF'
+            tail -c 60000 plan.txt
+            echo 'PLAN_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment the plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '### Terraform plan — `terraform/envs/prod`',
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              `${{ steps.plan.outputs.summary }}`,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      # The plan can contain resource attributes worth treating as sensitive, so it is
+      # kept only long enough for the apply job to consume it.
+      - name: Upload the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  apply:
+    name: Apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.apply)
+    runs-on: ubuntu-latest
+    # Requires a reviewer on the `production` environment. Infrastructure changes to the
+    # cluster and the database that holds every avatar's identity should not merge
+    # straight to apply unattended.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.1
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan

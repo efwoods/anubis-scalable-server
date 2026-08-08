@@ -1,0 +1,65 @@
+{{- if .Values.prePull.enabled }}
+# Image pre-pull.
+#
+# The Anubis image is 12.8 GB. When cluster-autoscaler adds a node, the scheduler will
+# place a real pod on it immediately and that pod sits in ContainerCreating for minutes
+# while the image downloads -- which defeats the point of autoscaling.
+#
+# This DaemonSet lands on every node (including brand-new ones), pulls the image as its
+# init container, and then idles at near-zero cost. Because the image is already in the
+# node's containerd store, the real pod starts fast.
+#
+# The tag is set on every deploy so the DaemonSet re-pulls the version about to roll out.
+# With SOCI lazy loading enabled this is belt-and-braces; without SOCI it is the only
+# thing keeping scale-out latency bounded. See docs/image-pipeline.md §4.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: anubis-image-prepull
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anubis-image-prepull
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anubis-image-prepull
+        {{- include "anubis-platform.labels" . | nindent 8 }}
+    spec:
+      # Must run on the media node group too, which is tainted.
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: media
+          effect: NoSchedule
+      # Lowest possible priority: this must never evict or delay real work.
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 0
+      initContainers:
+        # Pulling the image is the entire job; the container exits immediately.
+        - name: prepull
+          image: "{{ .Values.prePull.image }}:{{ .Values.prePull.tag }}"
+          command: ["/bin/true"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      containers:
+        # Something has to keep the pod Running so the DaemonSet stays scheduled and the
+        # image is not garbage-collected by kubelet's image GC.
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+{{- end }}

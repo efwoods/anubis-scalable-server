@@ -1,0 +1,46 @@
+fullnameOverride: "portal-server"
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  # The container's Dockerfile EXPOSEs 8080 and uvicorn binds it.
+  port: 8080
+
+# Stateless, no models, no media work. It talks to Stripe and Auth0 over HTTPS and
+# proxies auth to the Anubis API.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+envFromSecret: portal-env
+
+extraEnv: []
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+nodeSelector:
+  workload: general
+
+terminationGracePeriodSeconds: 60
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: portal-server
+  annotations: {}

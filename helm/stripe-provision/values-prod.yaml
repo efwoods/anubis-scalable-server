@@ -1,0 +1,41 @@
+# Production values for the Stripe provisioning hook.
+#
+#   helm upgrade --install stripe-provision ./helm/stripe-provision \
+#     -f helm/stripe-provision/values-prod.yaml \
+#     --set image.tag=<git-sha> -n anubis --wait --timeout 30m
+#
+# Runs between the platform chart and anubis-api. A failure here stops the deploy, which
+# is the point: an API pod that starts with no billing config treats paying customers as
+# free tier.
+
+image:
+  repository: "" # <account>.dkr.ecr.us-east-2.amazonaws.com/anubis-langgraph-api
+  tag: "" # git SHA, set by --set at deploy time
+
+awsCliImage: public.ecr.aws/aws-cli/aws-cli:2.27.49
+
+# LIVE Stripe account. The dev equivalent drops this flag and points at a sk_test_ key.
+live: true
+
+envFromSecret: anubis-env
+secretId: anubis/prod/env
+awsRegion: us-east-2
+
+serviceAccount:
+  create: true
+  name: anubis-stripe-provision
+  annotations: {} # eks.amazonaws.com/role-arn: <terraform output -raw stripe_provision_role_arn>
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+activeDeadlineSeconds: 1800
+backoffLimit: 2
+
+nodeSelector:
+  workload: general

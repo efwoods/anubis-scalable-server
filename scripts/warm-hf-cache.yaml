@@ -1,0 +1,80 @@
+# Warm the shared Hugging Face weight cache on EFS.
+#
+# ensure_huggingface_models_cached (huggingface_prefetch.py:21) downloads the store's
+# embedding model and the GoEmotions classifier during lifespan startup. On Compose that
+# is masked by a bind-mounted ~/.cache/huggingface; on Kubernetes each cold pod would
+# re-download them -- minutes of delay exactly when the HPA is trying to add capacity.
+#
+# Run once after the platform chart creates the PVC:
+#
+#   scripts/warm-hf-cache.sh                          # renders and applies this
+#   kubectl wait --for=condition=complete job/warm-hf-cache -n anubis --timeout=20m
+#
+# Skipping it is not fatal -- the first pod of each Deployment warms the cache itself and
+# simply takes several extra minutes to become ready.
+#
+# Retired by docs/upstream-changes.md #5 (bake the weights into the base image).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: warm-hf-cache
+  namespace: anubis
+  labels:
+    app.kubernetes.io/name: warm-hf-cache
+    app.kubernetes.io/part-of: anubis
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: warm-hf-cache
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        workload: general
+      containers:
+        - name: warm
+          # Substituted by scripts/warm-hf-cache.sh. Uses the application image because
+          # it already carries huggingface_hub and the repo ids to prefetch.
+          image: "__IMAGE__"
+          workingDir: /deps/anubis
+          command:
+            - python
+            - -c
+            - |
+              # Reuses the application's own prefetch helper rather than duplicating the
+              # model list, so this cannot drift out of lockstep with the code.
+              from src.anubis.utils.context import GlobalContext
+              from src.anubis.utils.huggingface_prefetch import (
+                  GO_EMOTIONS_MODEL_ID,
+                  ensure_huggingface_models_cached,
+              )
+
+              context = GlobalContext()
+              print(f"Prefetching {context.embedding_model} and {GO_EMOTIONS_MODEL_ID}")
+              ensure_huggingface_models_cached(context)
+              print("Hugging Face cache warmed.")
+          env:
+            - name: PYTHONPATH
+              value: /deps/anubis
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+          envFrom:
+            # Needs HUGGINGFACE_TOKEN and EMBEDDING_MODEL from the projected environment.
+            - secretRef:
+                name: anubis-env
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: anubis-model-cache

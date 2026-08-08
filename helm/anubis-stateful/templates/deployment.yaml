@@ -1,0 +1,102 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "anubis-stateful must run exactly one replica: the media-job registry (webapp.py:1270) and the MCP relay registry (webapp.py:2709) are per-process, so a second replica returns 404 for jobs and devices the other pod owns. Scale this tier vertically (resources) or land docs/upstream-changes.md #2 and #3 first." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.fullnameOverride }}
+  labels:
+    {{- include "anubis-stateful.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. Two pods must never hold the media-job registry at the
+  # same time, and the routes are pinned to a single Service endpoint anyway. The
+  # trade-off is a real gap in media availability during an upgrade -- runbook §2 says
+  # to check for in-flight jobs first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "anubis-stateful.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "anubis-stateful.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when the projected environment changes, not only when the image
+        # does. Without this an ESO refresh of anubis-env is invisible to a running pod.
+        checksum/values: {{ toYaml .Values | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: anubis
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ .Values.envFromSecret }}
+          env:
+            {{- toYaml .Values.extraEnv | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Same check docker-compose-prod.yml:44 uses.
+          livenessProbe:
+            exec:
+              command: ["python", "/api/healthcheck.py"]
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["python", "/api/healthcheck.py"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Model load plus pool setup on a cold pod. 20 minutes of budget so a slow but
+          # healthy start is not mistaken for a crash loop.
+          startupProbe:
+            exec:
+              command: ["python", "/api/healthcheck.py"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 80
+          lifecycle:
+            preStop:
+              exec:
+                # Let the ALB deregister this target before SIGTERM so no new upload is
+                # accepted into a registry that is about to disappear.
+                command: ["sleep", "15"]
+          volumeMounts:
+            {{- if .Values.modelCache.enabled }}
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            {{- end }}
+            # Ephemeral per-turn analysis workspaces (context.py:494) and the large
+            # temporary audio files ffmpeg/moviepy write during media processing.
+            - name: analysis-workspace
+              mountPath: /tmp/anubis-analysis
+            - name: media-scratch
+              mountPath: /tmp/media
+      volumes:
+        {{- if .Values.modelCache.enabled }}
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: {{ .Values.modelCache.claimName }}
+        {{- end }}
+        - name: analysis-workspace
+          emptyDir:
+            sizeLimit: {{ .Values.analysisWorkspaceSizeGi }}Gi
+        - name: media-scratch
+          emptyDir:
+            sizeLimit: {{ .Values.analysisWorkspaceSizeGi }}Gi

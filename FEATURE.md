@@ -8,5 +8,9 @@ The API requires a Postgres DB, Redis Cluster, and VM from which to autoscale to
 https://docs.langchain.com/langsmith/agent-server
 
 ## These are the resources that will be required:
-https://docs.langchain.com/langsmith/control-plane
+https://docs.langchain.com/langsmith/cont
+rol-plane
 
+/home/user/gh/anubis-project/anubis-customer-portal/src/server
+
+/home/user/gh/anubis-project/anubis

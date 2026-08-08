@@ -1,0 +1,9 @@
+apiVersion: v2
+name: portal-server
+description: >-
+  The Neural Nexus customer portal backend-for-frontend (anubis-customer-portal/src/server):
+  a small stateless FastAPI service that fronts Stripe and the Auth0 Management API for
+  the Vercel-hosted React client. Replaces the portal-live Compose stack on host :8200.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

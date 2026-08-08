@@ -1,0 +1,181 @@
+# Stripe billing provisioning.
+#
+# Mirrors the `stripe-provision` service in docker-compose-prod.yml:95-111, including its
+# deliberate ordering guarantee: the API must not start with no billing config, because
+# that silently treats paying customers as free tier. Compose expresses this with
+# `condition: service_completed_successfully`; here it is a Helm hook whose failure aborts
+# the release before anubis-api is deployed.
+#
+# The one behavioural difference from Compose, and the reason this Job has three stages:
+# Compose hands billing_config.json to the API through a shared Docker volume, which pods
+# cannot do. Instead the config is written back into Secrets Manager, and External Secrets
+# Operator projects it into anubis-env as STRIPE_BILLING_CONFIG_JSON for every pod.
+# See docs/runbook.md §4.
+#
+# Stages, split by which tools each image actually has -- the Anubis image is a wolfi
+# Python base with no aws CLI and no jq, and the aws-cli image has no application code:
+#
+#   1. fetch-secret  (aws-cli)      read the current secret JSON
+#   2. provision     (anubis image) run the script, merge its output with stdlib json
+#   3. publish       (aws-cli)      write the merged JSON back
+#
+# The script is idempotent -- meters matched by event_name, products by their metadata
+# triple, prices by lookup_key -- so a re-run reports "exists" for everything and emits
+# identical JSON. It does perform live-account writes on every deploy. That is safe by
+# idempotency, not by omission.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: anubis-stripe-provision
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: anubis
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    # Jobs are immutable, so the previous one is removed before this is created.
+    # Deliberately NOT hook-succeeded: keeping the finished Job means `kubectl logs
+    # job/...` still works when reconciling an invoice question days later.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anubis-stripe-provision
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+
+      initContainers:
+        - name: fetch-secret
+          image: {{ .Values.awsCliImage | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              aws secretsmanager get-secret-value \
+                --secret-id "$SECRET_ID" --region "$AWS_REGION" \
+                --query SecretString --output text > /shared/current.json
+              echo "Read $(wc -c < /shared/current.json) bytes from $SECRET_ID."
+          env:
+            - name: SECRET_ID
+              value: {{ .Values.secretId | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.awsRegion | quote }}
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+
+        - name: provision
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          workingDir: /deps/anubis
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              export STRIPE_BILLING_CONFIG_FILE=/shared/billing_config.json
+              python scripts/provision_stripe_billing.py {{ if .Values.live }}--live{{ end }}
+
+              # Merge into the existing secret with the standard library -- no jq in this
+              # image, and none needed. Every other key is left untouched.
+              python - <<'PYTHON'
+              import json
+              import pathlib
+              import sys
+
+              config_path = pathlib.Path("/shared/billing_config.json")
+              if not config_path.exists() or not config_path.stat().st_size:
+                  sys.exit(
+                      "provision_stripe_billing.py exited 0 but wrote no config; "
+                      "refusing to publish an empty billing config."
+                  )
+
+              billing_config = json.loads(config_path.read_text())
+              if not billing_config:
+                  sys.exit("Billing config is empty; refusing to publish it.")
+
+              secret = json.loads(pathlib.Path("/shared/current.json").read_text())
+              # The application reads this as a JSON *string*, matching how
+              # STRIPE_BILLING_CONFIG_JSON is supplied in .env.
+              secret["STRIPE_BILLING_CONFIG_JSON"] = json.dumps(
+                  billing_config, separators=(",", ":")
+              )
+              pathlib.Path("/shared/updated.json").write_text(json.dumps(secret))
+
+              print(f"Merged billing config for tiers: {sorted(billing_config)}")
+              PYTHON
+          env:
+            # scripts/ imports `src.anubis...`; put the repo root on the path. Same
+            # reason as PYTHONPATH in docker-compose-prod.yml:103.
+            - name: PYTHONPATH
+              value: /deps/anubis
+          envFrom:
+            - secretRef:
+                name: {{ .Values.envFromSecret }}
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+      containers:
+        - name: publish
+          image: {{ .Values.awsCliImage | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              aws secretsmanager put-secret-value \
+                --secret-id "$SECRET_ID" --region "$AWS_REGION" \
+                --secret-string "file:///shared/updated.json" > /dev/null
+              echo "Published STRIPE_BILLING_CONFIG_JSON to $SECRET_ID."
+              echo "Pods pick it up on the next External Secrets refresh, or immediately on a fresh pod."
+          env:
+            - name: SECRET_ID
+              value: {{ .Values.secretId | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.awsRegion | quote }}
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+
+      volumes:
+        # The secret JSON passes through here in cleartext, so it never touches disk.
+        - name: shared
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+---
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  labels:
+    app.kubernetes.io/name: anubis-stripe-provision
+    app.kubernetes.io/part-of: anubis
+  annotations:
+    # Created before the Job that uses it.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+    {{- with .Values.serviceAccount.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

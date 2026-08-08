@@ -1,0 +1,11 @@
+apiVersion: v2
+name: anubis-stripe-provision
+description: >-
+  Runs anubis/scripts/provision_stripe_billing.py --live as a Helm hook Job and publishes
+  the resulting billing config into Secrets Manager, replacing the shared Docker volume
+  the Compose stack uses for the same handoff (docker-compose-prod.yml:95-111). Deployed
+  between the platform chart and anubis-api so a failed provision stops the deploy before
+  any API pod starts with no billing config.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

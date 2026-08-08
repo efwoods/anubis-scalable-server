@@ -1,0 +1,61 @@
+{{- if .Values.modelCache.enabled }}
+# Shared Hugging Face weight cache.
+#
+# ensure_huggingface_models_cached (huggingface_prefetch.py:21) downloads the 640-dim
+# embedding model and the GoEmotions classifier during lifespan startup. On Compose that
+# is masked by a bind-mounted ~/.cache/huggingface; on Kubernetes every cold pod would
+# re-download them -- minutes of delay exactly when the HPA is adding capacity.
+#
+# ReadWriteMany because both Deployments and every replica mount it. EFS is static-
+# provisioned here (rather than dynamically) so the volume outlives any single Helm
+# release and only ever has to be warmed once.
+#
+# Retired by upstream change #5 (bake the weights into the image).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-models
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+provisioner: efs.csi.aws.com
+# Static provisioning: the PV below names the file system explicitly.
+parameters:
+  provisioningMode: efs-ap
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: anubis-model-cache
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+spec:
+  capacity:
+    # EFS is elastic; this figure exists only to satisfy the PV/PVC binding contract.
+    storage: {{ .Values.modelCache.storageGi }}Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-models
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: {{ printf "%s::%s" .Values.modelCache.fileSystemId .Values.modelCache.accessPointId | quote }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anubis-model-cache
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-models
+  volumeName: anubis-model-cache
+  resources:
+    requests:
+      storage: {{ .Values.modelCache.storageGi }}Gi
+{{- end }}

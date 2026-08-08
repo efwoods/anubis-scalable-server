@@ -1,0 +1,64 @@
+# Defaults for the platform chart. Real values live in values-prod.yaml.
+
+nameOverride: ""
+namespace: anubis
+
+aws:
+  region: us-east-2
+  accountId: ""
+
+# External Secrets Operator. The controller itself is installed separately (see
+# helm/platform/README.md); this chart creates the ClusterSecretStore and the
+# ExternalSecret resources that use it.
+externalSecrets:
+  enabled: true
+  serviceAccountName: external-secrets
+  serviceAccountNamespace: external-secrets
+  # How often ESO re-reads Secrets Manager. Also the window within which a
+  # STRIPE_BILLING_CONFIG_JSON written by the provisioning hook reaches the pods.
+  refreshInterval: 1h
+  secrets:
+    - name: anubis-env
+      remoteKey: anubis/prod/env
+    - name: portal-env
+      remoteKey: portal/prod/env
+
+# One ALB shared by all three Ingresses via the group.name annotation. Path ordering is
+# what routes the pod-local media and MCP paths to anubis-stateful; see
+# architecture/scalable_architecture.md §3.
+ingress:
+  enabled: true
+  groupName: anubis
+  certificateArn: ""
+  scheme: internet-facing
+  # SSE streams on /message and the /mcp/relay WebSocket both outlive the 60s default.
+  idleTimeoutSeconds: 3600
+  stickinessSeconds: 86400
+  deregistrationDelaySeconds: 300
+  hosts:
+    api: api.neuralnexus.site
+    portal: checkout-api.neuralnexus.site
+  # Paths served by the single-replica anubis-stateful Deployment. Everything else on
+  # the api host falls through to anubis-api.
+  statefulPaths:
+    - /update_avatar_identity_with_media
+    - /media_jobs
+    - /media_job
+    - /mcp
+
+# EFS-backed cache for the Hugging Face weights that ensure_huggingface_models_cached
+# downloads at lifespan startup. Retired by upstream change #5.
+modelCache:
+  enabled: true
+  fileSystemId: ""
+  accessPointId: ""
+  storageGi: 20
+
+# Pulls the current image onto every node before the scheduler needs it there.
+prePull:
+  enabled: true
+  image: ""
+  tag: ""
+
+podDisruptionBudgets:
+  enabled: true

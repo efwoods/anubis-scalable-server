@@ -1,0 +1,232 @@
+# Deploy the Helm releases to EKS.
+#
+# Images are built and pushed by the source repositories (docs/image-pipeline.md §3),
+# which then fire a `repository_dispatch` at this workflow with the new tag. It can also
+# be run by hand to redeploy an existing tag -- that is the rollback path.
+#
+# The release order is load-bearing twice:
+#   1. stripe-provision must succeed before any API pod starts, or a paying customer is
+#      silently treated as free tier.
+#   2. anubis-api runs the Agent Server schema migrations that anubis-stateful depends on.
+name: Deploy
+
+on:
+  repository_dispatch:
+    types: [image-published]
+  workflow_dispatch:
+    inputs:
+      anubis_tag:
+        description: "Anubis image tag (git SHA). Leave empty to keep what is deployed."
+        type: string
+      portal_tag:
+        description: "Portal image tag (git SHA). Leave empty to keep what is deployed."
+        type: string
+      skip_stripe_provision:
+        description: "Skip Stripe provisioning. Only for an incident redeploy when Stripe is down."
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  CLUSTER_NAME: anubis-prod
+  NAMESPACE: anubis
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          set -euo pipefail
+
+          # repository_dispatch carries one service; workflow_dispatch may carry both.
+          dispatch_service='${{ github.event.client_payload.service }}'
+          dispatch_tag='${{ github.event.client_payload.tag }}'
+
+          anubis_tag='${{ inputs.anubis_tag }}'
+          portal_tag='${{ inputs.portal_tag }}'
+
+          if [ "$dispatch_service" = "anubis" ]; then
+            anubis_tag="${dispatch_tag:0:7}"
+          elif [ "$dispatch_service" = "portal" ]; then
+            portal_tag="${dispatch_tag:0:7}"
+          fi
+
+          # An unspecified tag means "leave that release alone", so read back what is
+          # currently running rather than defaulting to something arbitrary.
+          if [ -z "$anubis_tag" ]; then
+            anubis_tag="$(kubectl get deploy -n "$NAMESPACE" -l app.kubernetes.io/name=anubis-stateful \
+              -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null | awk -F: '{print $NF}')"
+          fi
+          if [ -z "$portal_tag" ]; then
+            portal_tag="$(kubectl get deploy portal-server -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | awk -F: '{print $NF}')"
+          fi
+
+          [ -n "$anubis_tag" ] || { echo "::error::No Anubis tag given and none deployed."; exit 1; }
+
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          {
+            echo "registry=$registry"
+            echo "anubis_tag=$anubis_tag"
+            echo "portal_tag=$portal_tag"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Anubis: ${registry}/anubis-langgraph-api:${anubis_tag}" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$portal_tag" ] && echo "Portal: ${registry}/portal-server:${portal_tag}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the images exist in ECR
+        # Better to fail here than to watch pods sit in ImagePullBackOff.
+        run: |
+          set -euo pipefail
+          aws ecr describe-images --repository-name anubis-langgraph-api \
+            --image-ids "imageTag=${{ steps.tags.outputs.anubis_tag }}" > /dev/null
+          if [ -n "${{ steps.tags.outputs.portal_tag }}" ]; then
+            aws ecr describe-images --repository-name portal-server \
+              --image-ids "imageTag=${{ steps.tags.outputs.portal_tag }}" > /dev/null
+          fi
+
+      - name: Read Terraform outputs
+        id: tf
+        run: |
+          set -euo pipefail
+          # The Helm values reference infrastructure that only Terraform knows about.
+          # Read it from the deployed state rather than duplicating it in this workflow.
+          certificate_arn="$(aws acm list-certificates \
+            --query "CertificateSummaryList[?DomainName=='api.neuralnexus.site'].CertificateArn | [0]" \
+            --output text)"
+          file_system_id="$(aws efs describe-file-systems \
+            --query "FileSystems[?Name=='anubis-prod-models'].FileSystemId | [0]" --output text)"
+          access_point_id="$(aws efs describe-access-points --file-system-id "$file_system_id" \
+            --query "AccessPoints[0].AccessPointId" --output text)"
+          {
+            echo "certificate_arn=$certificate_arn"
+            echo "file_system_id=$file_system_id"
+            echo "access_point_id=$access_point_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Platform (secrets, ALB, model cache, pre-pull)
+        run: |
+          helm upgrade --install platform ./helm/platform \
+            -f helm/platform/values-prod.yaml \
+            -n "$NAMESPACE" --create-namespace \
+            --set ingress.certificateArn="${{ steps.tf.outputs.certificate_arn }}" \
+            --set modelCache.fileSystemId="${{ steps.tf.outputs.file_system_id }}" \
+            --set modelCache.accessPointId="${{ steps.tf.outputs.access_point_id }}" \
+            --set prePull.image="${{ steps.tags.outputs.registry }}/anubis-langgraph-api" \
+            --set prePull.tag="${{ steps.tags.outputs.anubis_tag }}" \
+            --wait --timeout 10m
+
+      - name: Wait for the projected secrets
+        # Nothing downstream can start until External Secrets Operator has synced.
+        run: |
+          kubectl wait --for=condition=Ready externalsecret/anubis-env -n "$NAMESPACE" --timeout=5m
+          kubectl wait --for=condition=Ready externalsecret/portal-env -n "$NAMESPACE" --timeout=5m
+
+      - name: Stripe provisioning
+        if: ${{ !inputs.skip_stripe_provision }}
+        # A failure here stops the deploy on purpose: an API pod with no billing config
+        # treats paying customers as free tier. Billing correctness beats availability.
+        run: |
+          helm upgrade --install stripe-provision ./helm/stripe-provision \
+            -f helm/stripe-provision/values-prod.yaml \
+            -n "$NAMESPACE" \
+            --set image.repository="${{ steps.tags.outputs.registry }}/anubis-langgraph-api" \
+            --set image.tag="${{ steps.tags.outputs.anubis_tag }}" \
+            --wait --timeout 30m
+
+      - name: Agent Server — chat tier
+        run: |
+          helm repo add langchain https://langchain-ai.github.io/helm/
+          helm repo update
+          helm upgrade --install anubis-api langchain/langgraph-cloud \
+            -f helm/anubis-api/values-prod.yaml \
+            -n "$NAMESPACE" \
+            --set images.apiServerImage.repository="${{ steps.tags.outputs.registry }}/anubis-langgraph-api" \
+            --set images.apiServerImage.tag="${{ steps.tags.outputs.anubis_tag }}" \
+            --wait --timeout 20m
+
+      - name: Check for in-flight media jobs
+        # anubis-stateful rolls with strategy Recreate and holds its job registry in
+        # process, so an upgrade mid-batch loses that work (upstream change #2).
+        continue-on-error: true
+        run: |
+          in_flight="$(kubectl exec -n "$NAMESPACE" deploy/anubis-stateful -- \
+            curl -sf localhost:8000/media_jobs 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2 || echo 0)"
+          if [ "${in_flight:-0}" -gt 0 ]; then
+            echo "::warning::${in_flight} media job(s) in flight; the anubis-stateful restart below will lose them."
+          fi
+
+      - name: Agent Server — media and MCP tier
+        run: |
+          helm upgrade --install anubis-stateful ./helm/anubis-stateful \
+            -f helm/anubis-stateful/values-prod.yaml \
+            -n "$NAMESPACE" \
+            --set image.repository="${{ steps.tags.outputs.registry }}/anubis-langgraph-api" \
+            --set image.tag="${{ steps.tags.outputs.anubis_tag }}" \
+            --wait --timeout 20m
+
+      - name: Customer portal
+        if: ${{ steps.tags.outputs.portal_tag != '' }}
+        run: |
+          helm upgrade --install portal-server ./helm/portal-server \
+            -f helm/portal-server/values-prod.yaml \
+            -n "$NAMESPACE" \
+            --set image.repository="${{ steps.tags.outputs.registry }}/portal-server" \
+            --set image.tag="${{ steps.tags.outputs.portal_tag }}" \
+            --wait --timeout 10m
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          # Through the ALB, with the production Host header. Checks the routing rules and
+          # the certificate, not just that pods are Running.
+          alb="$(kubectl get ingress anubis-api -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          echo "ALB: $alb"
+
+          curl -sf --max-time 30 "https://api.neuralnexus.site/ok" -o /dev/null \
+            && echo "Agent Server /ok: OK"
+
+          # The environment field is the check that matters -- a 200 alone does not say
+          # which Stripe account is behind it.
+          portal_health="$(curl -sf --max-time 30 "https://checkout-api.neuralnexus.site/healthz")"
+          echo "Portal: $portal_health"
+          echo "$portal_health" | grep -q '"environment":"live"' \
+            || echo "::warning::Portal is not reporting the live environment."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployed"
+            echo ""
+            kubectl get pods -n "$NAMESPACE" -o wide
+            echo ""
+            kubectl get hpa -n "$NAMESPACE"
+          } >> "$GITHUB_STEP_SUMMARY"

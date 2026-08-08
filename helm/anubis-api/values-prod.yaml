@@ -1,0 +1,198 @@
+# Values for LangChain's `langgraph-cloud` chart, running the Anubis Agent Server's
+# chat / CRUD tier.
+#
+#   helm repo add langchain https://langchain-ai.github.io/helm/
+#   helm upgrade --install anubis-api langchain/langgraph-cloud \
+#     -f helm/anubis-api/values-prod.yaml \
+#     --set images.apiServerImage.tag=<git-sha> -n anubis
+#
+# Chart reference:
+#   https://github.com/langchain-ai/helm/tree/main/charts/langgraph-cloud
+#
+# This release owns the Agent Server schema migrations, so it installs BEFORE
+# anubis-stateful, which runs the same image against the same database.
+
+images:
+  apiServerImage:
+    repository: "" # <account>.dkr.ecr.us-east-2.amazonaws.com/anubis-langgraph-api
+    tag: "" # git SHA, set by --set at deploy time; never a floating tag
+    pullPolicy: IfNotPresent
+
+config:
+  # LANGSMITH_API_KEY and LANGGRAPH_CLOUD_LICENSE_KEY both arrive through the anubis-env
+  # Secret rather than being set here, so no key value ever lands in a values file or in
+  # Helm release history. A missing or unentitled license key means the pods will not
+  # start -- see architecture/scalable_architecture.md §7.
+  existingSecretName: anubis-env
+
+# ---------------------------------------------------------------------------------------
+# Queue workers: OFF.
+#
+# Anubis executes graphs in-process inside the custom FastAPI app -- graph.astream at
+# webapp.py:900, graph.ainvoke at :3563 and :3834 -- and a repo-wide search for
+# `client.runs.*` finds nothing. Nothing is ever enqueued, so dedicated queue workers
+# would idle while the API tier does all the work.
+#
+# Turning this on is Phase 2, gated on docs/upstream-changes.md #1.
+# ---------------------------------------------------------------------------------------
+queue:
+  enabled: false
+
+apiServer:
+  deployment:
+    replicaCount: 2
+
+    # The API tier IS the compute tier here. 4Gi is the floor, not a guess: each pod
+    # holds the torch runtime plus the 640-dim embedding model and the GoEmotions
+    # classifier resident in memory. Below this the pod OOMs during model load rather
+    # than under traffic, which is a confusing failure to debug.
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "2"
+        memory: 8Gi
+
+    # ~200 environment variables, projected from Secrets Manager by External Secrets
+    # Operator (see helm/platform).
+    envFrom:
+      - secretRef:
+          name: anubis-env
+
+    extraEnv:
+      - name: PORT
+        value: "8000"
+      # The MCP relay registry is in-process (webapp.py:2709), and the daemon's
+      # WebSocket lives on an anubis-stateful pod. A graph running here cannot reach it,
+      # so the feature is disabled on this tier rather than failing at call time.
+      # Removed once docs/upstream-changes.md #3 lands.
+      - name: DATA_ANALYSIS_ENABLED
+        value: "false"
+      # Compose passes the billing config through a shared volume; pods cannot. On
+      # Kubernetes the value comes from STRIPE_BILLING_CONFIG_JSON in anubis-env, which
+      # the provisioning hook writes. Blank the file path so it cannot shadow it.
+      - name: STRIPE_BILLING_CONFIG_FILE
+        value: ""
+      - name: HF_HOME
+        value: /root/.cache/huggingface
+
+    # Same check docker-compose-prod.yml:44 uses. An exec probe rather than an HTTP one
+    # because the custom app registers a catch-all GET route (webapp.py:1341) whose
+    # interaction with the server's own /ok is worth verifying before relying on it.
+    livenessProbe:
+      exec:
+        command: ["python", "/api/healthcheck.py"]
+      initialDelaySeconds: 120
+      periodSeconds: 60
+      timeoutSeconds: 10
+      failureThreshold: 3
+    readinessProbe:
+      exec:
+        command: ["python", "/api/healthcheck.py"]
+      initialDelaySeconds: 30
+      periodSeconds: 15
+      timeoutSeconds: 10
+      failureThreshold: 3
+    # A cold pod loads models and opens pools before it is useful. 20 minutes of startup
+    # budget stops a slow-but-healthy pod from being killed and restarted forever.
+    startupProbe:
+      exec:
+        command: ["python", "/api/healthcheck.py"]
+      initialDelaySeconds: 20
+      periodSeconds: 15
+      failureThreshold: 80
+
+    # /message streams SSE for as long as a run takes (2-20s today, occasionally far
+    # longer). The preStop sleep lets the ALB finish draining this pod's target before
+    # SIGTERM, so an in-flight stream is not cut mid-token.
+    terminationGracePeriodSeconds: 600
+    lifecycle:
+      preStop:
+        exec:
+          command: ["sleep", "15"]
+
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+
+    nodeSelector:
+      workload: general
+
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: langgraph-cloud
+
+    volumeMounts:
+      - name: model-cache
+        mountPath: /root/.cache/huggingface
+      # Ephemeral per-turn analysis workspaces (context.py:494 defaults to
+      # /tmp/anubis-analysis and deletes them when the turn ends).
+      - name: analysis-workspace
+        mountPath: /tmp/anubis-analysis
+
+    volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: anubis-model-cache
+      - name: analysis-workspace
+        emptyDir:
+          sizeLimit: 10Gi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 65
+    behavior:
+      scaleUp:
+        # Deliberately unhurried: a new pod may need to pull a 12.8 GB image, so
+        # thrashing the replica count costs more than it buys. minReplicas: 2 means
+        # there is always warm headroom while a new pod comes up.
+        stabilizationWindowSeconds: 120
+        policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 120
+      scaleDown:
+        stabilizationWindowSeconds: 600
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 300
+
+  serviceAccount:
+    create: true
+    name: anubis-api
+    annotations: {}
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# The ALB is shared by all three workloads and is defined once in helm/platform, so this
+# chart must not create an Ingress of its own.
+ingress:
+  enabled: false
+
+# RDS and ElastiCache, not in-cluster StatefulSets. Connection URIs come from
+# DATABASE_URI / POSTGRES_URI and REDIS_URI inside anubis-env.
+postgres:
+  external:
+    enabled: true
+    existingSecretName: anubis-env
+
+redis:
+  external:
+    enabled: true
+    existingSecretName: anubis-env

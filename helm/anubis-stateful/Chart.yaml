@@ -1,0 +1,10 @@
+apiVersion: v2
+name: anubis-stateful
+description: >-
+  The single-replica Anubis tier. Runs the same image as anubis-api, but owns the routes
+  backed by pod-local state — the in-process media-job registry (webapp.py:1270) and the
+  in-process MCP relay registry (webapp.py:2709) — so the chat tier is free to scale
+  horizontally. Retired once docs/upstream-changes.md #2 and #3 land.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

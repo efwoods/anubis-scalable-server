@@ -1,0 +1,88 @@
+{{- if .Values.ingress.enabled }}
+# Three Ingress objects, one ALB.
+#
+# `group.order` is the whole mechanism that makes the two-Deployment split work: the ALB
+# evaluates listener rules in ascending order, so the specific media and MCP prefixes
+# (order 10) must be matched before the catch-all (order 20). Reverse them and every
+# media request lands on a freely-scaling anubis-api pod, where the in-process media-job
+# registry does not have the job -- a 404 that looks like data loss.
+#
+# See architecture/scalable_architecture.md §2.2 and §3.1.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: anubis-stateful
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+  annotations:
+    {{- include "anubis-platform.albAnnotations" . | nindent 4 }}
+    alb.ingress.kubernetes.io/group.order: "10"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: {{ .Values.ingress.hosts.api | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.statefulPaths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: anubis-stateful
+                port:
+                  number: 8000
+          {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: anubis-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+  annotations:
+    {{- include "anubis-platform.albAnnotations" . | nindent 4 }}
+    alb.ingress.kubernetes.io/group.order: "20"
+    # The Agent Server's own readiness endpoint. Verify this is not shadowed by the
+    # catch-all route at webapp.py:1341 -- runbook §7 covers the check.
+    alb.ingress.kubernetes.io/healthcheck-path: /ok
+spec:
+  ingressClassName: alb
+  rules:
+    - host: {{ .Values.ingress.hosts.api | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: anubis-api
+                port:
+                  number: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: portal-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "anubis-platform.labels" . | nindent 4 }}
+  annotations:
+    {{- include "anubis-platform.albAnnotations" . | nindent 4 }}
+    alb.ingress.kubernetes.io/group.order: "30"
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+spec:
+  ingressClassName: alb
+  rules:
+    - host: {{ .Values.ingress.hosts.portal | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: portal-server
+                port:
+                  number: 8080
+{{- end }}

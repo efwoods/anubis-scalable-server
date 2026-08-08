@@ -1,0 +1,66 @@
+# Production values for the platform chart.
+#
+# Every empty string below is filled from a Terraform output. The deploy workflow does it
+# with --set; when installing by hand:
+#
+#   cd terraform/envs/prod
+#   terraform output -raw acm_certificate_arn
+#   terraform output -raw efs_file_system_id
+#   terraform output -raw efs_access_point_id
+#   terraform output -json repository_urls
+
+namespace: anubis
+
+aws:
+  region: us-east-2
+
+externalSecrets:
+  enabled: true
+  serviceAccountName: external-secrets
+  serviceAccountNamespace: external-secrets
+  # One hour is a deliberate trade-off. Shorter means more Secrets Manager API calls for
+  # ~200 keys; longer means the Stripe provisioning hook's freshly written
+  # STRIPE_BILLING_CONFIG_JSON takes longer to reach the pods. The hook's own upgrade
+  # gate makes the delay harmless -- runbook §4.
+  refreshInterval: 1h
+  secrets:
+    - name: anubis-env
+      remoteKey: anubis/prod/env
+    - name: portal-env
+      remoteKey: portal/prod/env
+
+ingress:
+  enabled: true
+  groupName: anubis
+  scheme: internet-facing
+  certificateArn: "" # terraform output -raw acm_certificate_arn
+  idleTimeoutSeconds: 3600
+  stickinessSeconds: 86400
+  deregistrationDelaySeconds: 300
+  hosts:
+    api: api.neuralnexus.site
+    portal: checkout-api.neuralnexus.site
+  # These four prefixes cover every route backed by pod-local state:
+  #   /update_avatar_identity_with_media  -> creates jobs in app.state.media_jobs
+  #   /media_jobs, /media_job/*           -> read that same in-process registry
+  #   /mcp/*                              -> the in-process relay WebSocket registry
+  # Adding a route that touches either registry means adding it here too.
+  statefulPaths:
+    - /update_avatar_identity_with_media
+    - /media_jobs
+    - /media_job
+    - /mcp
+
+modelCache:
+  enabled: true
+  fileSystemId: "" # terraform output -raw efs_file_system_id
+  accessPointId: "" # terraform output -raw efs_access_point_id
+  storageGi: 20
+
+prePull:
+  enabled: true
+  image: "" # <account>.dkr.ecr.us-east-2.amazonaws.com/anubis-langgraph-api
+  tag: "" # the git SHA currently deployed
+
+podDisruptionBudgets:
+  enabled: true

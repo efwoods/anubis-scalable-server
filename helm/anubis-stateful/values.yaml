@@ -1,0 +1,62 @@
+nameOverride: ""
+fullnameOverride: "anubis-stateful"
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Fixed at 1 and validated in the template. The media-job registry and the MCP relay
+# registry are per-process; a second replica returns 404 for jobs the other pod owns.
+replicaCount: 1
+
+service:
+  port: 8000
+
+# Media preprocessing is CPU-bound: noisereduce spectral gating, librosa, soundfile, and
+# moviepy video demux, run at MEDIA_PROCESSING_CONCURRENCY in parallel per batch.
+# Transcription and diarization are OpenAI API calls, so no GPU is needed.
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    cpu: "4"
+    memory: 16Gi
+
+envFromSecret: anubis-env
+
+extraEnv:
+  - name: PORT
+    value: "8000"
+  - name: HF_HOME
+    value: /root/.cache/huggingface
+  # This tier holds the MCP relay WebSockets, so the data-analysis tools work here.
+  - name: DATA_ANALYSIS_ENABLED
+    value: "true"
+  - name: STRIPE_BILLING_CONFIG_FILE
+    value: ""
+
+nodeSelector:
+  workload: media
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: media
+    effect: NoSchedule
+
+# A diarization batch can run for a long time past the request that started it. This is
+# how long Kubernetes waits for one to finish before SIGKILL.
+terminationGracePeriodSeconds: 1800
+
+modelCache:
+  enabled: true
+  claimName: anubis-model-cache
+
+analysisWorkspaceSizeGi: 50
+
+serviceAccount:
+  create: true
+  name: anubis-stateful
+  annotations: {}

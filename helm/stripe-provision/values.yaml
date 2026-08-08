@@ -1,0 +1,44 @@
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Used by the fetch-secret and publish stages. The Anubis image is a wolfi Python base
+# with no aws CLI, so those two stages run here instead.
+awsCliImage: public.ecr.aws/aws-cli/aws-cli:2.27.49
+
+# --live points the script at the production Stripe account. The script refuses a key
+# that does not match the file it came from, so this and the STRIPE_SECRET_KEY inside
+# anubis-env must agree.
+live: true
+
+envFromSecret: anubis-env
+
+# Secrets Manager secret the Job writes STRIPE_BILLING_CONFIG_JSON back into. External
+# Secrets Operator then projects it into anubis-env for every pod.
+secretId: anubis/prod/env
+awsRegion: us-east-2
+
+serviceAccount:
+  create: true
+  name: anubis-stripe-provision
+  # eks.amazonaws.com/role-arn from `terraform output -raw stripe_provision_role_arn`.
+  # This role can WRITE the secret, which is why it is separate from the read-only role
+  # External Secrets Operator uses.
+  annotations: {}
+
+# Applied to the provision stage; the two aws-cli stages are sized inline.
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Stripe API calls over a slow link, on a pod that may be pulling a 12.8 GB image.
+activeDeadlineSeconds: 1800
+backoffLimit: 2
+
+nodeSelector:
+  workload: general
